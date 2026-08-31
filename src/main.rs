@@ -13,7 +13,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 const STARTER: &str = "# Todo\n\n- [ ] Add your first item\n\n## Later\n\n## Done\n";
 
@@ -1092,7 +1092,7 @@ impl App {
             return;
         }
         textarea.set_cursor_line_style(Style::default());
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
         self.input = Some(InputState { kind, textarea });
     }
 
@@ -1144,8 +1144,9 @@ impl App {
             TextArea::from(content)
         };
         textarea.set_cursor_line_style(Style::default());
-        textarea.move_cursor(tui_textarea::CursorMove::Bottom);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.set_wrap_mode(ratatui_textarea::WrapMode::Word);
+        textarea.move_cursor(ratatui_textarea::CursorMove::Bottom);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
         self.notes = Some(NotesState {
             start: it.start,
             child_len: it.len - 1,

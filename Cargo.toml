@@ -10,10 +10,10 @@ keywords = ["todo", "tui", "markdown", "terminal"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-tui-textarea = "0.7"
+ratatui-textarea = "0.9"
 
 [profile.release]
 strip = true
