@@ -246,6 +246,8 @@ struct App {
     input: Option<InputState>,
     move_menu: Option<MoveMenu>,
     history: Option<HistoryView>,
+    /// Quit-confirmation popup; the bool is whether "yes" is highlighted.
+    quit_confirm: Option<bool>,
     /// Collapsed section names, in-memory only.
     collapsed: HashSet<String>,
     undo: Vec<Vec<String>>,
@@ -405,6 +407,7 @@ impl App {
             input: None,
             move_menu: None,
             history: None,
+            quit_confirm: None,
             collapsed: HashSet::new(),
             undo: Vec::new(),
         };
@@ -1416,13 +1419,33 @@ fn run(path: &Path, startup_status: Option<String>) -> io::Result<()> {
             continue;
         }
 
+        if let Some(yes) = app.quit_confirm {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('y') => break,
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if yes {
+                        break;
+                    }
+                    app.quit_confirm = None;
+                }
+                KeyCode::Char('n') => app.quit_confirm = None,
+                KeyCode::Char('h')
+                | KeyCode::Char('l')
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Tab => app.quit_confirm = Some(!yes),
+                _ => {}
+            }
+            continue;
+        }
+
         app.status.clear();
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.undo_last()?;
             }
-            KeyCode::Char('q') | KeyCode::Esc => break,
+            KeyCode::Char('q') | KeyCode::Esc => app.quit_confirm = Some(true),
             KeyCode::Char('j') | KeyCode::Down if !shift => app.nav_down(),
             KeyCode::Char('k') | KeyCode::Up if !shift => app.nav_up(),
             KeyCode::Char('J') | KeyCode::Down => app.move_item(1)?,
@@ -1730,6 +1753,33 @@ fn draw(f: &mut Frame, app: &App) {
         f.render_stateful_widget(list, area, &mut st);
     }
 
+    if let Some(yes) = app.quit_confirm {
+        let w = 26.min(main.width);
+        let h = 3.min(main.height);
+        let area = Rect::new(
+            main.x + (main.width - w) / 2,
+            main.y + (main.height - h) / 2,
+            w,
+            h,
+        );
+        let sel = Style::new().bg(Color::Rgb(50, 55, 70)).bold();
+        let buttons = Line::from(vec![
+            Span::styled("[ yes ]", if yes { sel } else { Style::new() }),
+            Span::raw("    "),
+            Span::styled("[ no ]", if !yes { sel } else { Style::new() }),
+        ]);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" quit? ");
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(buttons)
+                .alignment(Alignment::Center)
+                .block(block),
+            area,
+        );
+    }
+
     if app.show_help {
         let binds = [
             ("j/k", "move (walks into subtasks)"),
@@ -1752,7 +1802,7 @@ fn draw(f: &mut Frame, app: &App) {
             ("r", "reload from disk"),
             ("ctrl+z", "undo"),
             ("~", "this help"),
-            ("q/esc", "quit"),
+            ("q/esc", "quit (press twice to confirm)"),
         ];
         let lines: Vec<Line> = binds
             .iter()
@@ -1781,6 +1831,8 @@ fn draw(f: &mut Frame, app: &App) {
 
     let help = if app.show_help {
         " any key to close".to_string()
+    } else if app.quit_confirm.is_some() {
+        " q/esc/y quit · n stay · h/l choose · enter select".to_string()
     } else if app.move_menu.is_some() {
         " j/k choose · enter move · esc cancel".to_string()
     } else if app.input.is_some() {
@@ -1817,6 +1869,7 @@ mod tests {
             input: None,
             move_menu: None,
             history: None,
+            quit_confirm: None,
             collapsed: HashSet::new(),
             undo: Vec::new(),
         }
