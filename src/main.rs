@@ -11,7 +11,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding};
 use tui_textarea::TextArea;
 
 const STARTER: &str = "# Todo\n\n- [ ] Add your first item\n\n## Later\n\n## Done\n";
@@ -57,6 +57,12 @@ struct NotesState {
     textarea: TextArea<'static>,
 }
 
+/// Single-line prompt for adding a new todo or editing an existing title.
+struct InputState {
+    editing: bool,
+    textarea: TextArea<'static>,
+}
+
 struct App {
     path: PathBuf,
     lines: Vec<String>,
@@ -66,6 +72,7 @@ struct App {
     hide_done: bool,
     status: String,
     notes: Option<NotesState>,
+    input: Option<InputState>,
 }
 
 /// A renderable row in the main list.
@@ -179,6 +186,7 @@ impl App {
             hide_done: false,
             status: String::new(),
             notes: None,
+            input: None,
         };
         app.reload()?;
         Ok(app)
@@ -422,6 +430,85 @@ impl App {
         self.save()
     }
 
+    fn add_todo(&mut self, text: &str) -> io::Result<()> {
+        let dest = self.todo_end();
+        self.lines.insert(dest, format!("- [ ] {text}"));
+        self.tidy();
+        self.save()?;
+        self.cursor = self
+            .visible_items()
+            .iter()
+            .rposition(|it| self.section_at(it.start) == SectionKind::Todo)
+            .unwrap_or(0);
+        self.status = "added".to_string();
+        Ok(())
+    }
+
+    fn delete_current(&mut self) -> io::Result<()> {
+        let vis = self.visible_items();
+        let Some(it) = vis.get(self.cursor).copied() else {
+            return Ok(());
+        };
+        let (_, idx) = task_info(&self.lines[it.start]).unwrap();
+        let (title, _) = split_stamp(&self.lines[it.start][idx + 2..]);
+        self.lines.drain(it.start..it.start + it.len);
+        self.tidy();
+        self.save()?;
+        self.clamp_cursor();
+        self.status = format!("deleted: {title}");
+        Ok(())
+    }
+
+    fn edit_title(&mut self, text: &str) -> io::Result<()> {
+        let vis = self.visible_items();
+        let Some(it) = vis.get(self.cursor).copied() else {
+            return Ok(());
+        };
+        let (_, idx) = task_info(&self.lines[it.start]).unwrap();
+        let (_, stamp) = split_stamp(&self.lines[it.start][idx + 2..]);
+        let mut line = format!("{} {}", &self.lines[it.start][..idx + 2], text);
+        if let Some(st) = stamp {
+            line.push_str(&format!(" @done({st})"));
+        }
+        self.lines[it.start] = line;
+        self.save()
+    }
+
+    fn open_input(&mut self, editing: bool) {
+        let mut textarea = if editing {
+            let vis = self.visible_items();
+            let Some(it) = vis.get(self.cursor).copied() else {
+                return;
+            };
+            let (_, idx) = task_info(&self.lines[it.start]).unwrap();
+            let (title, _) = split_stamp(&self.lines[it.start][idx + 2..]);
+            TextArea::from(vec![title])
+        } else {
+            TextArea::default()
+        };
+        textarea.set_cursor_line_style(Style::default());
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+        self.input = Some(InputState { editing, textarea });
+    }
+
+    fn commit_input(&mut self) -> io::Result<()> {
+        let Some(is) = self.input.take() else {
+            return Ok(());
+        };
+        let text = is.textarea.lines().join(" ").trim().to_string();
+        if text.is_empty() {
+            self.status = "cancelled".to_string();
+            return Ok(());
+        }
+        if is.editing {
+            self.edit_title(&text)?;
+            self.status = "edited".to_string();
+        } else {
+            self.add_todo(&text)?;
+        }
+        Ok(())
+    }
+
     fn open_notes(&mut self) {
         let vis = self.visible_items();
         let Some(it) = vis.get(self.cursor).copied() else {
@@ -545,7 +632,7 @@ fn run(path: &Path) -> io::Result<()> {
     let mut app = App::load(path)?;
 
     loop {
-        if app.notes.is_none() && app.externally_modified() {
+        if app.notes.is_none() && app.input.is_none() && app.externally_modified() {
             app.reload()?;
             app.status = "reloaded (changed on disk)".to_string();
         }
@@ -572,6 +659,22 @@ fn run(path: &Path) -> io::Result<()> {
             continue;
         }
 
+        if app.input.is_some() {
+            match key.code {
+                KeyCode::Enter => app.commit_input()?,
+                KeyCode::Esc => {
+                    app.input = None;
+                    app.status = "cancelled".to_string();
+                }
+                _ => {
+                    if let Some(is) = app.input.as_mut() {
+                        is.textarea.input(key);
+                    }
+                }
+            }
+            continue;
+        }
+
         app.status.clear();
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
@@ -587,6 +690,9 @@ fn run(path: &Path) -> io::Result<()> {
             }
             KeyCode::Char('J') | KeyCode::Down => app.move_item(1)?,
             KeyCode::Char('K') | KeyCode::Up => app.move_item(-1)?,
+            KeyCode::Char('n') | KeyCode::Char('N') => app.open_input(false),
+            KeyCode::Char('e') => app.open_input(true),
+            KeyCode::Char('X') => app.delete_current()?,
             KeyCode::Tab => app.open_notes(),
             KeyCode::Char(' ') | KeyCode::Enter => app.toggle()?,
             KeyCode::Char('l') => app.cycle_later()?,
@@ -711,8 +817,23 @@ fn draw(f: &mut Frame, app: &App) {
     state.select(selected_row);
     f.render_stateful_widget(list, main, &mut state);
 
-    let help = if app.status.is_empty() {
-        " j/k move · space done · J/K reorder · l later · tab notes · h hide done · q quit"
+    if let Some(is) = &app.input {
+        let h = 3.min(main.height);
+        let area = Rect::new(main.x, main.y + main.height - h, main.width, h);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .title(if is.editing { " edit " } else { " new todo " });
+        let inner = block.inner(area);
+        f.render_widget(Clear, area);
+        f.render_widget(block, area);
+        f.render_widget(&is.textarea, inner);
+    }
+
+    let help = if app.input.is_some() {
+        " enter save · esc cancel".to_string()
+    } else if app.status.is_empty() {
+        " j/k move · space done · n new · e edit · X del · J/K reorder · l later · tab notes · h hide done · q quit"
             .to_string()
     } else {
         format!(" {}", app.status)
@@ -737,6 +858,7 @@ mod tests {
             hide_done: false,
             status: String::new(),
             notes: None,
+            input: None,
         }
     }
 
@@ -830,6 +952,65 @@ mod tests {
         let vis = app.visible_items();
         assert_eq!(app.lines[vis[1].start], "- [ ] a");
         assert_eq!(app.section_at(vis[1].start), SectionKind::Todo);
+        let _ = fs::remove_file(&app.path);
+    }
+
+    #[test]
+    fn add_todo_appends_to_todo_section() {
+        let mut app = app_from(&["# Todo", "", "- [ ] a", "", "## Later", "", "- [ ] l1"]);
+        app.add_todo("new task").unwrap();
+        let vis = app.visible_items();
+        assert_eq!(app.lines[vis[1].start], "- [ ] new task");
+        assert_eq!(app.section_at(vis[1].start), SectionKind::Todo);
+        assert_eq!(app.cursor, 1);
+        let _ = fs::remove_file(&app.path);
+    }
+
+    #[test]
+    fn delete_removes_item_with_children() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] parent",
+            "  note line",
+            "  - [ ] sub",
+            "",
+            "- [ ] second",
+        ]);
+        app.delete_current().unwrap();
+        assert!(!app.lines.iter().any(|l| l.contains("parent")));
+        assert!(!app.lines.iter().any(|l| l.contains("note line")));
+        assert!(!app.lines.iter().any(|l| l.contains("sub")));
+        let vis = app.visible_items();
+        assert_eq!(vis.len(), 1);
+        assert_eq!(app.lines[vis[0].start], "- [ ] second");
+        let _ = fs::remove_file(&app.path);
+    }
+
+    #[test]
+    fn edit_title_preserves_children_and_stamp() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] old title",
+            "  note line",
+            "",
+            "## Done",
+            "",
+            "- [x] finished @done(2026-08-29 09:00)",
+        ]);
+        app.edit_title("new title").unwrap();
+        let vis = app.visible_items();
+        assert_eq!(app.lines[vis[0].start], "- [ ] new title");
+        assert_eq!(app.lines[vis[0].start + 1], "  note line");
+
+        app.cursor = 1;
+        app.edit_title("renamed").unwrap();
+        let vis = app.visible_items();
+        assert_eq!(
+            app.lines[vis[1].start],
+            "- [x] renamed @done(2026-08-29 09:00)"
+        );
         let _ = fs::remove_file(&app.path);
     }
 }
