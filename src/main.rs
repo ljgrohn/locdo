@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io;
@@ -61,7 +62,40 @@ struct NotesState {
 enum InputKind {
     NewTask,
     NewSub,
+    NewSection,
     Edit,
+}
+
+/// A selectable position in the main list: a task, or a collapsed
+/// section's heading line.
+#[derive(Clone, Copy)]
+enum Entry {
+    Task(Item),
+    Section(usize),
+}
+
+#[derive(Clone, PartialEq)]
+enum MoveDest {
+    Todo,
+    Section(String),
+    Later,
+    NewSection,
+}
+
+impl MoveDest {
+    fn label(&self) -> &str {
+        match self {
+            MoveDest::Todo => "todo",
+            MoveDest::Section(name) => name,
+            MoveDest::Later => "later",
+            MoveDest::NewSection => "new section…",
+        }
+    }
+}
+
+struct MoveMenu {
+    options: Vec<MoveDest>,
+    sel: usize,
 }
 
 /// Single-line prompt for adding a new todo/subtask or editing a title.
@@ -84,6 +118,9 @@ struct App {
     status: String,
     notes: Option<NotesState>,
     input: Option<InputState>,
+    move_menu: Option<MoveMenu>,
+    /// Collapsed section names, in-memory only.
+    collapsed: HashSet<String>,
     undo: Vec<Vec<String>>,
 }
 
@@ -100,6 +137,11 @@ enum Row {
     Sub {
         text: String,
         done: bool,
+    },
+    CollapsedSection {
+        name: String,
+        done: usize,
+        total: usize,
     },
 }
 
@@ -206,6 +248,8 @@ impl App {
             status: String::new(),
             notes: None,
             input: None,
+            move_menu: None,
+            collapsed: HashSet::new(),
             undo: Vec::new(),
         };
         app.reload()?;
@@ -239,6 +283,41 @@ impl App {
         current.is_some() && current != self.mtime
     }
 
+    /// Cursor-navigable entries: visible tasks, plus one stop per collapsed
+    /// section (whose tasks are skipped).
+    fn entries(&self) -> Vec<Entry> {
+        let its = items(&self.lines);
+        let mut out = Vec::new();
+        let mut it_idx = 0;
+        let mut in_collapsed = false;
+        let mut i = 0;
+        while i < self.lines.len() {
+            let line = &self.lines[i];
+            if is_heading(line) {
+                let name = line.trim_start_matches('#').trim().to_string();
+                in_collapsed = line.starts_with("##") && self.collapsed.contains(&name);
+                if in_collapsed && !(self.hide_done && section_kind(&name) == SectionKind::Done) {
+                    out.push(Entry::Section(i));
+                }
+                i += 1;
+                continue;
+            }
+            if it_idx < its.len() && its[it_idx].start == i {
+                let it = its[it_idx];
+                it_idx += 1;
+                i = it.start + it.len;
+                if !in_collapsed && !(self.hide_done && it.done) {
+                    out.push(Entry::Task(it));
+                }
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Test helper: visible tasks ignoring collapse state.
+    #[cfg(test)]
     fn visible_items(&self) -> Vec<Item> {
         items(&self.lines)
             .into_iter()
@@ -246,8 +325,16 @@ impl App {
             .collect()
     }
 
+    /// The item under the cursor, unless a collapsed section is selected.
+    fn current_item(&self) -> Option<Item> {
+        match self.entries().get(self.cursor)? {
+            Entry::Task(it) => Some(*it),
+            Entry::Section(_) => None,
+        }
+    }
+
     fn clamp_cursor(&mut self) {
-        let n = self.visible_items().len();
+        let n = self.entries().len();
         if n == 0 {
             self.cursor = 0;
         } else if self.cursor >= n {
@@ -255,9 +342,8 @@ impl App {
         }
         if let Some(k) = self.sub {
             let nsubs = self
-                .visible_items()
-                .get(self.cursor)
-                .map(|it| self.sub_line_indices(*it).len())
+                .current_item()
+                .map(|it| self.sub_line_indices(it).len())
                 .unwrap_or(0);
             self.sub = if nsubs == 0 { None } else { Some(k.min(nsubs - 1)) };
         }
@@ -272,7 +358,7 @@ impl App {
 
     /// Line index of the selected task or subtask, if any.
     fn current_task_line(&self) -> Option<usize> {
-        let it = self.visible_items().get(self.cursor).copied()?;
+        let it = self.current_item()?;
         match self.sub {
             Some(k) => self.sub_line_indices(it).get(k).copied(),
             None => Some(it.start),
@@ -280,16 +366,16 @@ impl App {
     }
 
     fn nav_down(&mut self) {
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
-            return;
-        };
-        let nsubs = self.sub_line_indices(it).len();
+        let entries = self.entries();
+        let nsubs = self
+            .current_item()
+            .map(|it| self.sub_line_indices(it).len())
+            .unwrap_or(0);
         match self.sub {
             None if nsubs > 0 => self.sub = Some(0),
             Some(k) if k + 1 < nsubs => self.sub = Some(k + 1),
             _ => {
-                if self.cursor + 1 < vis.len() {
+                if self.cursor + 1 < entries.len() {
                     self.cursor += 1;
                     self.sub = None;
                 }
@@ -306,7 +392,7 @@ impl App {
                     self.cursor -= 1;
                     self.sub = None;
                     if self.expand_all {
-                        if let Some(it) = self.visible_items().get(self.cursor).copied() {
+                        if let Some(it) = self.current_item() {
                             let n = self.sub_line_indices(it).len();
                             if n > 0 {
                                 self.sub = Some(n - 1);
@@ -340,11 +426,161 @@ impl App {
         self.save()
     }
 
+    /// On a task: collapses its containing `##` section (cursor moves to the
+    /// header stop). On a collapsed header: expands it.
+    fn toggle_collapse(&mut self) {
+        match self.entries().get(self.cursor).copied() {
+            Some(Entry::Section(h)) => {
+                let name = self.lines[h].trim_start_matches('#').trim().to_string();
+                self.collapsed.remove(&name);
+                self.clamp_cursor();
+            }
+            Some(Entry::Task(it)) => {
+                let Some(h) = self.lines[..it.start]
+                    .iter()
+                    .rposition(|l| l.starts_with("##"))
+                else {
+                    self.status = "top area has no section to collapse".to_string();
+                    return;
+                };
+                let name = self.lines[h].trim_start_matches('#').trim().to_string();
+                self.collapsed.insert(name);
+                self.sub = None;
+                self.cursor = self
+                    .entries()
+                    .iter()
+                    .position(|e| matches!(e, Entry::Section(x) if *x == h))
+                    .unwrap_or(0);
+            }
+            None => {}
+        }
+    }
+
+    /// Appends the selected collapsed section to the sidecar archive file
+    /// and removes it from the todo file.
+    fn archive_section(&mut self) -> io::Result<()> {
+        let Some(Entry::Section(h)) = self.entries().get(self.cursor).copied() else {
+            self.status = "collapse a section first (c), then A archives it".to_string();
+            return Ok(());
+        };
+        self.checkpoint();
+        let name = self.lines[h].trim_start_matches('#').trim().to_string();
+        let end = self.lines[h + 1..]
+            .iter()
+            .position(|l| l.starts_with("##"))
+            .map(|p| h + 1 + p)
+            .unwrap_or(self.lines.len());
+        let mut block: Vec<String> = self.lines.drain(h..end).collect();
+        while block.last().is_some_and(|l| l.trim().is_empty()) {
+            block.pop();
+        }
+        let sidecar = self.path.with_extension("archive.md");
+        let mut out = fs::read_to_string(&sidecar).unwrap_or_default();
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&block.join("\n"));
+        out.push('\n');
+        fs::write(&sidecar, out)?;
+        self.collapsed.remove(&name);
+        self.tidy();
+        self.save()?;
+        self.clamp_cursor();
+        self.status = format!("archived: {name}");
+        Ok(())
+    }
+
+    /// Returns the heading line of a custom section, creating it before the
+    /// Later/Done headings if missing.
+    fn create_section(&mut self, name: &str) -> usize {
+        if let Some(h) = self.heading_line(name) {
+            return h;
+        }
+        let pos = self
+            .heading_line("later")
+            .or_else(|| self.heading_line("done"))
+            .unwrap_or(self.lines.len());
+        self.lines.insert(pos, format!("## {name}"));
+        self.lines.insert(pos + 1, String::new());
+        pos
+    }
+
+    /// Moves the current main task's block to the end of a destination
+    /// section (creating a custom section if needed).
+    fn move_current_to(&mut self, dest: &MoveDest) -> io::Result<()> {
+        if self.sub.is_some() {
+            return Ok(());
+        }
+        let Some(it) = self.current_item() else {
+            return Ok(());
+        };
+        if it.done {
+            self.status = "item is done — untick it first".to_string();
+            return Ok(());
+        }
+        self.checkpoint();
+        let (dest_idx, label) = match dest {
+            MoveDest::Todo => (self.todo_end(), "todo".to_string()),
+            MoveDest::Later => {
+                self.ensure_section("Later");
+                (self.later_end(), "later".to_string())
+            }
+            MoveDest::Section(name) => {
+                let h = self.create_section(name);
+                (self.section_end(h), name.clone())
+            }
+            MoveDest::NewSection => return Ok(()),
+        };
+        // creating a section may have shifted lines; re-locate the task
+        let Some(it) = self.current_item() else {
+            return Ok(());
+        };
+        self.move_block(it.start, it.len, dest_idx);
+        self.tidy();
+        self.save()?;
+        self.clamp_cursor();
+        self.status = format!("moved to {label}");
+        Ok(())
+    }
+
+    fn open_move_menu(&mut self) {
+        if self.sub.is_some() {
+            return;
+        }
+        let Some(it) = self.current_item() else {
+            return;
+        };
+        if it.done {
+            self.status = "item is done — untick it first".to_string();
+            return;
+        }
+        let mut options = vec![MoveDest::Todo];
+        for (_, name) in self.sections() {
+            if section_kind(&name) == SectionKind::Todo {
+                options.push(MoveDest::Section(name));
+            }
+        }
+        options.push(MoveDest::Later);
+        options.push(MoveDest::NewSection);
+        self.move_menu = Some(MoveMenu { options, sel: 0 });
+    }
+
+    fn commit_move(&mut self) -> io::Result<()> {
+        let Some(menu) = self.move_menu.take() else {
+            return Ok(());
+        };
+        let dest = menu.options[menu.sel].clone();
+        if dest == MoveDest::NewSection {
+            self.open_input(InputKind::NewSection);
+            return Ok(());
+        }
+        self.move_current_to(&dest)
+    }
+
     /// Toggles the selected subtask; done subs sink below the parent's open
     /// subs but never leave the parent's block.
     fn toggle_sub(&mut self) -> io::Result<()> {
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
+        let Some(it) = self.current_item() else {
             return Ok(());
         };
         let subs = self.sub_line_indices(it);
@@ -373,8 +609,7 @@ impl App {
     /// Inserts a one-level subtask under the cursor's item, after its last
     /// open sub (above done ones), or right beneath the parent line.
     fn add_subtask(&mut self, text: &str) -> io::Result<()> {
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
+        let Some(it) = self.current_item() else {
             return Ok(());
         };
         self.checkpoint();
@@ -388,7 +623,9 @@ impl App {
             .unwrap_or(it.start + 1);
         self.lines.insert(insert_at, format!("  - [ ] {text}"));
         self.save()?;
-        let it = self.visible_items()[self.cursor];
+        let Some(it) = self.current_item() else {
+            return Ok(());
+        };
         self.sub = self
             .sub_line_indices(it)
             .iter()
@@ -422,27 +659,41 @@ impl App {
         i
     }
 
-    /// End of the Todo region: just before the first Later/Done heading,
-    /// backed up over any blank separator lines.
+    /// End of the top "inbox" area: just before the first `##` section
+    /// heading of any kind, backed up over blank separator lines.
     fn todo_end(&self) -> usize {
         let end = self
             .lines
             .iter()
-            .position(|l| {
-                is_heading(l) && section_kind(l.trim_start_matches('#').trim()) != SectionKind::Todo
-            })
+            .position(|l| l.starts_with("##"))
+            .unwrap_or(self.lines.len());
+        self.back_over_blanks(end)
+    }
+
+    /// Level-2 section headings as (line index, name), in file order.
+    fn sections(&self) -> Vec<(usize, String)> {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("##"))
+            .map(|(i, l)| (i, l.trim_start_matches('#').trim().to_string()))
+            .collect()
+    }
+
+    /// End of the section headed at `h`: just before the next `##` heading
+    /// or EOF, backed up over blank lines.
+    fn section_end(&self, h: usize) -> usize {
+        let end = self.lines[h + 1..]
+            .iter()
+            .position(|l| l.starts_with("##"))
+            .map(|p| h + 1 + p)
             .unwrap_or(self.lines.len());
         self.back_over_blanks(end)
     }
 
     fn later_end(&self) -> usize {
         let h = self.heading_line("later").expect("later section exists");
-        let end = self.lines[h + 1..]
-            .iter()
-            .position(|l| is_heading(l))
-            .map(|p| h + 1 + p)
-            .unwrap_or(self.lines.len());
-        self.back_over_blanks(end)
+        self.section_end(h)
     }
 
     fn back_over_blanks(&self, mut i: usize) -> usize {
@@ -511,8 +762,7 @@ impl App {
     }
 
     fn toggle(&mut self) -> io::Result<()> {
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
+        let Some(it) = self.current_item() else {
             return Ok(());
         };
         self.checkpoint();
@@ -555,8 +805,7 @@ impl App {
         if self.sub.is_some() {
             return Ok(());
         }
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
+        let Some(it) = self.current_item() else {
             return Ok(());
         };
         if it.done {
@@ -583,14 +832,17 @@ impl App {
         if self.sub.is_some() {
             return Ok(());
         }
-        let vis = self.visible_items();
+        let entries = self.entries();
         let target = self.cursor as isize + delta;
-        if target < 0 || target as usize >= vis.len() {
+        if target < 0 || target as usize >= entries.len() {
             return Ok(());
         }
+        let (Some(Entry::Task(cur)), Some(Entry::Task(tgt))) =
+            (entries.get(self.cursor).copied(), entries.get(target as usize).copied())
+        else {
+            return Ok(());
+        };
         self.checkpoint();
-        let cur = vis[self.cursor];
-        let tgt = vis[target as usize];
         let dest = if delta < 0 {
             tgt.start
         } else {
@@ -609,18 +861,18 @@ impl App {
         self.tidy();
         self.save()?;
         self.sub = None;
+        let top_end = self.todo_end();
         self.cursor = self
-            .visible_items()
+            .entries()
             .iter()
-            .rposition(|it| self.section_at(it.start) == SectionKind::Todo)
+            .rposition(|e| matches!(e, Entry::Task(it) if it.start < top_end))
             .unwrap_or(0);
         self.status = "added".to_string();
         Ok(())
     }
 
     fn delete_current(&mut self) -> io::Result<()> {
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
+        let Some(it) = self.current_item() else {
             return Ok(());
         };
         self.checkpoint();
@@ -674,7 +926,7 @@ impl App {
         } else {
             TextArea::default()
         };
-        if kind == InputKind::NewSub && self.visible_items().is_empty() {
+        if kind == InputKind::NewSub && self.current_item().is_none() {
             return;
         }
         textarea.set_cursor_line_style(Style::default());
@@ -698,13 +950,13 @@ impl App {
             }
             InputKind::NewTask => self.add_todo(&text)?,
             InputKind::NewSub => self.add_subtask(&text)?,
+            InputKind::NewSection => self.move_current_to(&MoveDest::Section(text))?,
         }
         Ok(())
     }
 
     fn open_notes(&mut self) {
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
+        let Some(it) = self.current_item() else {
             return;
         };
         let children: Vec<String> = self.lines[it.start + 1..it.start + it.len].to_vec();
@@ -772,12 +1024,28 @@ impl App {
         let mut rows = Vec::new();
         let mut it_idx = 0;
         let mut vis_seen = 0;
+        let mut in_collapsed = false;
         let mut i = 0;
         while i < self.lines.len() {
             let line = &self.lines[i];
             if is_heading(line) {
                 let name = line.trim_start_matches('#').trim().to_string();
-                if !(self.hide_done && section_kind(&name) == SectionKind::Done) {
+                let hidden = self.hide_done && section_kind(&name) == SectionKind::Done;
+                in_collapsed = line.starts_with("##") && self.collapsed.contains(&name);
+                if in_collapsed {
+                    if !hidden {
+                        let end = self.lines[i + 1..]
+                            .iter()
+                            .position(|l| l.starts_with("##"))
+                            .map(|p| i + 1 + p)
+                            .unwrap_or(self.lines.len());
+                        let inside = its.iter().filter(|t| t.start > i && t.start < end);
+                        let total = inside.clone().count();
+                        let done = inside.filter(|t| t.done).count();
+                        rows.push(Row::CollapsedSection { name, done, total });
+                        vis_seen += 1;
+                    }
+                } else if !hidden {
                     rows.push(Row::Header(name));
                 }
                 i += 1;
@@ -787,7 +1055,7 @@ impl App {
                 let it = its[it_idx];
                 it_idx += 1;
                 i = it.start + it.len;
-                if self.hide_done && it.done {
+                if in_collapsed || (self.hide_done && it.done) {
                     continue;
                 }
                 let src = &self.lines[it.start];
@@ -838,7 +1106,11 @@ fn run(path: &Path) -> io::Result<()> {
     let mut app = App::load(path)?;
 
     loop {
-        if app.notes.is_none() && app.input.is_none() && app.externally_modified() {
+        if app.notes.is_none()
+            && app.input.is_none()
+            && app.move_menu.is_none()
+            && app.externally_modified()
+        {
             app.reload()?;
             app.status = "reloaded (changed on disk)".to_string();
         }
@@ -881,6 +1153,22 @@ fn run(path: &Path) -> io::Result<()> {
             continue;
         }
 
+        if let Some(menu) = app.move_menu.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    app.move_menu = None;
+                    app.status = "cancelled".to_string();
+                }
+                KeyCode::Enter => app.commit_move()?,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    menu.sel = (menu.sel + 1).min(menu.options.len() - 1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => menu.sel = menu.sel.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
+
         if app.show_help {
             app.show_help = false;
             continue;
@@ -901,6 +1189,9 @@ fn run(path: &Path) -> io::Result<()> {
             KeyCode::Char('s') => app.open_input(InputKind::NewSub),
             KeyCode::Char('e') => app.open_input(InputKind::Edit),
             KeyCode::Char('X') => app.delete_current()?,
+            KeyCode::Char('c') => app.toggle_collapse(),
+            KeyCode::Char('A') => app.archive_section()?,
+            KeyCode::Char('m') | KeyCode::Char('M') => app.open_move_menu(),
             KeyCode::Char('O') => {
                 app.expand_all = !app.expand_all;
                 if !app.expand_all {
@@ -916,7 +1207,9 @@ fn run(path: &Path) -> io::Result<()> {
             KeyCode::Char('~') => app.show_help = true,
             KeyCode::Tab => app.open_notes(),
             KeyCode::Char(' ') | KeyCode::Enter => {
-                if app.sub.is_some() {
+                if matches!(app.entries().get(app.cursor), Some(Entry::Section(_))) {
+                    app.toggle_collapse();
+                } else if app.sub.is_some() {
                     app.toggle_sub()?;
                 } else {
                     app.toggle()?;
@@ -933,7 +1226,7 @@ fn run(path: &Path) -> io::Result<()> {
                 app.sub = None;
             }
             KeyCode::Char('G') => {
-                app.cursor = app.visible_items().len().saturating_sub(1);
+                app.cursor = app.entries().len().saturating_sub(1);
                 app.sub = None;
             }
             KeyCode::Char('r') => {
@@ -1047,6 +1340,21 @@ fn draw(f: &mut Frame, app: &App) {
                     Span::styled(text.clone(), text_style),
                 ]))
             }
+            Row::CollapsedSection { name, done, total } => {
+                if task_seen == app.cursor {
+                    selected_row = Some(ri);
+                }
+                task_seen += 1;
+                sub_seen = 0;
+                ListItem::new(Line::from(vec![
+                    Span::styled("▸ ", Style::new().fg(Color::Cyan)),
+                    Span::styled(name.clone(), Style::new().fg(Color::Cyan).bold()),
+                    Span::styled(
+                        format!("  {done}/{total}"),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
         })
         .collect();
 
@@ -1081,12 +1389,41 @@ fn draw(f: &mut Frame, app: &App) {
             .title(match is.kind {
                 InputKind::NewTask => " new todo ",
                 InputKind::NewSub => " new subtask ",
+                InputKind::NewSection => " new section ",
                 InputKind::Edit => " edit ",
             });
         let inner = block.inner(area);
         f.render_widget(Clear, area);
         f.render_widget(block, area);
         f.render_widget(&is.textarea, inner);
+    }
+
+    if let Some(menu) = &app.move_menu {
+        let w = 36.min(main.width);
+        let h = (menu.options.len() as u16 + 2).min(main.height);
+        let area = Rect::new(
+            main.x + (main.width - w) / 2,
+            main.y + (main.height - h) / 2,
+            w,
+            h,
+        );
+        let opts: Vec<ListItem> = menu
+            .options
+            .iter()
+            .map(|d| ListItem::new(d.label().to_string()))
+            .collect();
+        let list = List::new(opts)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .padding(Padding::horizontal(1))
+                    .title(" move to "),
+            )
+            .highlight_style(Style::new().bg(Color::Rgb(50, 55, 70)));
+        let mut st = ListState::default();
+        st.select(Some(menu.sel));
+        f.render_widget(Clear, area);
+        f.render_stateful_widget(list, area, &mut st);
     }
 
     if app.show_help {
@@ -1097,6 +1434,9 @@ fn draw(f: &mut Frame, app: &App) {
             ("s", "new subtask"),
             ("e", "edit title"),
             ("X", "delete"),
+            ("m", "move to section"),
+            ("c", "collapse/expand section"),
+            ("A", "archive collapsed section"),
             ("J/K", "reorder"),
             ("l", "todo <-> later"),
             ("O", "expand/collapse all subtasks"),
@@ -1135,10 +1475,12 @@ fn draw(f: &mut Frame, app: &App) {
 
     let help = if app.show_help {
         " any key to close".to_string()
+    } else if app.move_menu.is_some() {
+        " j/k choose · enter move · esc cancel".to_string()
     } else if app.input.is_some() {
         " enter save · esc cancel".to_string()
     } else if app.status.is_empty() {
-        " j/k move · space done · n new · s sub · e edit · X del · O expand · ctrl+z undo · ~ help · q quit"
+        " j/k move · space done · n new · s sub · e edit · m move · c collapse · X del · ~ help · q quit"
             .to_string()
     } else {
         format!(" {}", app.status)
@@ -1167,6 +1509,8 @@ mod tests {
             status: String::new(),
             notes: None,
             input: None,
+            move_menu: None,
+            collapsed: HashSet::new(),
             undo: Vec::new(),
         }
     }
@@ -1405,6 +1749,125 @@ mod tests {
         assert_eq!(app2.lines[3], "  - [ ] first");
         assert_eq!(app2.lines[4], "  note line");
         let _ = fs::remove_file(&app2.path);
+    }
+
+    #[test]
+    fn todo_end_stops_before_custom_sections() {
+        let app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] inbox1",
+            "",
+            "## Groceries",
+            "",
+            "- [ ] milk",
+            "",
+            "## Done",
+        ]);
+        assert_eq!(app.todo_end(), 3);
+    }
+
+    #[test]
+    fn move_to_section_appends_and_creates() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] task a",
+            "",
+            "## Groceries",
+            "",
+            "- [ ] milk",
+        ]);
+        app.move_current_to(&MoveDest::Section("Groceries".into()))
+            .unwrap();
+        let g = app.heading_line("groceries").unwrap();
+        assert_eq!(app.lines[g + 2], "- [ ] milk");
+        assert_eq!(app.lines[g + 3], "- [ ] task a");
+
+        // moving to a section that doesn't exist creates it
+        app.cursor = 0; // milk
+        app.move_current_to(&MoveDest::Section("Work".into())).unwrap();
+        let w = app.heading_line("work").unwrap();
+        assert_eq!(app.lines[w + 2], "- [ ] milk");
+        assert_eq!(app.section_at(app.heading_line("groceries").unwrap() + 2), SectionKind::Todo);
+        let _ = fs::remove_file(&app.path);
+    }
+
+    #[test]
+    fn entries_include_collapsed_sections_as_single_stop() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] a",
+            "",
+            "## Later",
+            "",
+            "- [ ] l1",
+            "",
+            "## Done",
+            "",
+            "- [x] d1",
+        ]);
+        let e = app.entries();
+        assert_eq!(e.len(), 3);
+        assert!(e.iter().all(|x| matches!(x, Entry::Task(_))));
+        app.collapsed.insert("Later".to_string());
+        let e = app.entries();
+        assert_eq!(e.len(), 3);
+        assert!(matches!(e[0], Entry::Task(_)));
+        assert!(matches!(e[1], Entry::Section(4)));
+        assert!(matches!(e[2], Entry::Task(_)));
+    }
+
+    #[test]
+    fn collapse_key_targets_containing_section() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] inbox",
+            "",
+            "## Groceries",
+            "",
+            "- [ ] milk",
+        ]);
+        app.cursor = 1; // milk
+        app.toggle_collapse();
+        assert!(app.collapsed.contains("Groceries"));
+        assert!(matches!(app.entries()[app.cursor], Entry::Section(4)));
+        app.toggle_collapse();
+        assert!(app.collapsed.is_empty());
+        // top inbox area has no section to collapse
+        app.cursor = 0;
+        app.toggle_collapse();
+        assert!(app.collapsed.is_empty());
+    }
+
+    #[test]
+    fn archive_section_moves_to_sidecar() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] keep",
+            "",
+            "## Old",
+            "",
+            "- [ ] gone",
+            "  - [x] sub",
+        ]);
+        app.collapsed.insert("Old".to_string());
+        app.cursor = 1; // the collapsed section entry
+        app.archive_section().unwrap();
+        assert!(app.heading_line("old").is_none());
+        assert!(!app.lines.iter().any(|l| l.contains("gone")));
+        assert_eq!(app.lines[2], "- [ ] keep");
+        assert!(app.collapsed.is_empty());
+        let sidecar = app.path.with_extension("archive.md");
+        let archived = fs::read_to_string(&sidecar).unwrap();
+        assert!(archived.contains("## Old"));
+        assert!(archived.contains("- [ ] gone"));
+        assert!(archived.contains("  - [x] sub"));
+        let _ = fs::remove_file(&app.path);
+        let _ = fs::remove_file(&sidecar);
     }
 
     #[test]
