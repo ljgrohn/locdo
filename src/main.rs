@@ -265,6 +265,9 @@ impl App {
             .map(String::from)
             .collect();
         self.mtime = fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        // Undo snapshots predate what's now on disk; undoing across a reload
+        // would silently clobber external edits.
+        self.undo.clear();
         self.clamp_cursor();
         Ok(())
     }
@@ -1868,6 +1871,20 @@ mod tests {
         assert!(archived.contains("  - [x] sub"));
         let _ = fs::remove_file(&app.path);
         let _ = fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn reload_discards_stale_undo_snapshots() {
+        let mut app = app_from(&["# Todo", "", "- [ ] a", "- [ ] b"]);
+        app.path = std::env::temp_dir().join(format!("locdo-test-reload-{}.md", std::process::id()));
+        app.delete_current().unwrap(); // builds an undo snapshot
+        assert!(!app.undo.is_empty());
+        fs::write(&app.path, "# Todo\n\n- [ ] external edit\n").unwrap();
+        app.reload().unwrap();
+        app.undo_last().unwrap();
+        assert_eq!(app.status, "nothing to undo");
+        assert_eq!(app.lines[2], "- [ ] external edit");
+        let _ = fs::remove_file(&app.path);
     }
 
     #[test]
