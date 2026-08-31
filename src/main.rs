@@ -11,7 +11,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
 use tui_textarea::TextArea;
 
 const STARTER: &str = "# Todo\n\n- [ ] Add your first item\n\n## Later\n\n## Done\n";
@@ -57,9 +57,16 @@ struct NotesState {
     textarea: TextArea<'static>,
 }
 
-/// Single-line prompt for adding a new todo or editing an existing title.
+#[derive(Clone, Copy, PartialEq)]
+enum InputKind {
+    NewTask,
+    NewSub,
+    Edit,
+}
+
+/// Single-line prompt for adding a new todo/subtask or editing a title.
 struct InputState {
-    editing: bool,
+    kind: InputKind,
     textarea: TextArea<'static>,
 }
 
@@ -69,10 +76,15 @@ struct App {
     crlf: bool,
     mtime: Option<SystemTime>,
     cursor: usize,
+    /// Selected subtask index within the cursor item's sub lines, if any.
+    sub: Option<usize>,
+    expand_all: bool,
+    show_help: bool,
     hide_done: bool,
     status: String,
     notes: Option<NotesState>,
     input: Option<InputState>,
+    undo: Vec<Vec<String>>,
 }
 
 /// A renderable row in the main list.
@@ -84,6 +96,10 @@ enum Row {
         stamp: Option<String>,
         subs: Option<(usize, usize)>,
         has_notes: bool,
+    },
+    Sub {
+        text: String,
+        done: bool,
     },
 }
 
@@ -184,9 +200,13 @@ impl App {
             mtime: None,
             cursor: 0,
             hide_done: false,
+            sub: None,
+            expand_all: false,
+            show_help: false,
             status: String::new(),
             notes: None,
             input: None,
+            undo: Vec::new(),
         };
         app.reload()?;
         Ok(app)
@@ -233,6 +253,148 @@ impl App {
         } else if self.cursor >= n {
             self.cursor = n - 1;
         }
+        if let Some(k) = self.sub {
+            let nsubs = self
+                .visible_items()
+                .get(self.cursor)
+                .map(|it| self.sub_line_indices(*it).len())
+                .unwrap_or(0);
+            self.sub = if nsubs == 0 { None } else { Some(k.min(nsubs - 1)) };
+        }
+    }
+
+    /// Line indices of the subtask lines inside an item's child block.
+    fn sub_line_indices(&self, it: Item) -> Vec<usize> {
+        (it.start + 1..it.start + it.len)
+            .filter(|&i| task_info(&self.lines[i]).is_some())
+            .collect()
+    }
+
+    /// Line index of the selected task or subtask, if any.
+    fn current_task_line(&self) -> Option<usize> {
+        let it = self.visible_items().get(self.cursor).copied()?;
+        match self.sub {
+            Some(k) => self.sub_line_indices(it).get(k).copied(),
+            None => Some(it.start),
+        }
+    }
+
+    fn nav_down(&mut self) {
+        let vis = self.visible_items();
+        let Some(it) = vis.get(self.cursor).copied() else {
+            return;
+        };
+        let nsubs = self.sub_line_indices(it).len();
+        match self.sub {
+            None if nsubs > 0 => self.sub = Some(0),
+            Some(k) if k + 1 < nsubs => self.sub = Some(k + 1),
+            _ => {
+                if self.cursor + 1 < vis.len() {
+                    self.cursor += 1;
+                    self.sub = None;
+                }
+            }
+        }
+    }
+
+    fn nav_up(&mut self) {
+        match self.sub {
+            Some(0) => self.sub = None,
+            Some(k) => self.sub = Some(k - 1),
+            None => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    self.sub = None;
+                    if self.expand_all {
+                        if let Some(it) = self.visible_items().get(self.cursor).copied() {
+                            let n = self.sub_line_indices(it).len();
+                            if n > 0 {
+                                self.sub = Some(n - 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn checkpoint(&mut self) {
+        if self.undo.last() == Some(&self.lines) {
+            return;
+        }
+        self.undo.push(self.lines.clone());
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+    }
+
+    fn undo_last(&mut self) -> io::Result<()> {
+        let Some(prev) = self.undo.pop() else {
+            self.status = "nothing to undo".to_string();
+            return Ok(());
+        };
+        self.lines = prev;
+        self.sub = None;
+        self.clamp_cursor();
+        self.status = "undo".to_string();
+        self.save()
+    }
+
+    /// Toggles the selected subtask; done subs sink below the parent's open
+    /// subs but never leave the parent's block.
+    fn toggle_sub(&mut self) -> io::Result<()> {
+        let vis = self.visible_items();
+        let Some(it) = vis.get(self.cursor).copied() else {
+            return Ok(());
+        };
+        let subs = self.sub_line_indices(it);
+        let Some(&line_idx) = self.sub.and_then(|k| subs.get(k)) else {
+            return Ok(());
+        };
+        self.checkpoint();
+        let (done, sidx) = task_info(&self.lines[line_idx]).unwrap();
+        let mark = if done { " " } else { "x" };
+        self.lines[line_idx].replace_range(sidx..sidx + 1, mark);
+        // Stable-partition sub contents across the same line slots: open
+        // first, done last. Note lines between subs keep their positions.
+        let mut entries: Vec<(String, bool)> = subs
+            .iter()
+            .map(|&i| (self.lines[i].clone(), i == line_idx))
+            .collect();
+        entries.sort_by_key(|(l, _)| task_info(l).unwrap().0);
+        for (pos, &i) in subs.iter().enumerate() {
+            self.lines[i] = entries[pos].0.clone();
+        }
+        self.sub = entries.iter().position(|(_, toggled)| *toggled);
+        self.status = if done { "sub back open" } else { "sub done" }.to_string();
+        self.save()
+    }
+
+    /// Inserts a one-level subtask under the cursor's item, after its last
+    /// open sub (above done ones), or right beneath the parent line.
+    fn add_subtask(&mut self, text: &str) -> io::Result<()> {
+        let vis = self.visible_items();
+        let Some(it) = vis.get(self.cursor).copied() else {
+            return Ok(());
+        };
+        self.checkpoint();
+        let subs = self.sub_line_indices(it);
+        let insert_at = subs
+            .iter()
+            .rev()
+            .find(|&&i| !task_info(&self.lines[i]).unwrap().0)
+            .map(|&i| i + 1)
+            .or(subs.first().copied())
+            .unwrap_or(it.start + 1);
+        self.lines.insert(insert_at, format!("  - [ ] {text}"));
+        self.save()?;
+        let it = self.visible_items()[self.cursor];
+        self.sub = self
+            .sub_line_indices(it)
+            .iter()
+            .position(|&i| i == insert_at);
+        self.status = "sub added".to_string();
+        Ok(())
     }
 
     fn section_at(&self, line_idx: usize) -> SectionKind {
@@ -353,6 +515,7 @@ impl App {
         let Some(it) = vis.get(self.cursor).copied() else {
             return Ok(());
         };
+        self.checkpoint();
         let (done, idx) = task_info(&self.lines[it.start]).unwrap();
         if !done {
             let stamp = Local::now().format("%Y-%m-%d %H:%M").to_string();
@@ -387,7 +550,11 @@ impl App {
     }
 
     /// Moves the current item Todo -> Later, or Later -> Todo.
+    /// Sections are for main tasks only; does nothing on a subtask.
     fn cycle_later(&mut self) -> io::Result<()> {
+        if self.sub.is_some() {
+            return Ok(());
+        }
         let vis = self.visible_items();
         let Some(it) = vis.get(self.cursor).copied() else {
             return Ok(());
@@ -396,6 +563,7 @@ impl App {
             self.status = "item is done — untick it first".to_string();
             return Ok(());
         }
+        self.checkpoint();
         let dest = if self.section_at(it.start) == SectionKind::Later {
             self.status = "moved to todo".to_string();
             self.todo_end()
@@ -412,11 +580,15 @@ impl App {
     }
 
     fn move_item(&mut self, delta: isize) -> io::Result<()> {
+        if self.sub.is_some() {
+            return Ok(());
+        }
         let vis = self.visible_items();
         let target = self.cursor as isize + delta;
         if target < 0 || target as usize >= vis.len() {
             return Ok(());
         }
+        self.checkpoint();
         let cur = vis[self.cursor];
         let tgt = vis[target as usize];
         let dest = if delta < 0 {
@@ -431,10 +603,12 @@ impl App {
     }
 
     fn add_todo(&mut self, text: &str) -> io::Result<()> {
+        self.checkpoint();
         let dest = self.todo_end();
         self.lines.insert(dest, format!("- [ ] {text}"));
         self.tidy();
         self.save()?;
+        self.sub = None;
         self.cursor = self
             .visible_items()
             .iter()
@@ -449,6 +623,19 @@ impl App {
         let Some(it) = vis.get(self.cursor).copied() else {
             return Ok(());
         };
+        self.checkpoint();
+        if self.sub.is_some() {
+            let Some(line_idx) = self.current_task_line() else {
+                return Ok(());
+            };
+            let (_, idx) = task_info(&self.lines[line_idx]).unwrap();
+            let title = self.lines[line_idx][idx + 2..].trim().to_string();
+            self.lines.remove(line_idx);
+            self.save()?;
+            self.clamp_cursor();
+            self.status = format!("deleted sub: {title}");
+            return Ok(());
+        }
         let (_, idx) = task_info(&self.lines[it.start]).unwrap();
         let (title, _) = split_stamp(&self.lines[it.start][idx + 2..]);
         self.lines.drain(it.start..it.start + it.len);
@@ -459,36 +646,40 @@ impl App {
         Ok(())
     }
 
+    /// Rewrites the selected task or subtask title, preserving the checkbox
+    /// prefix and any @done stamp.
     fn edit_title(&mut self, text: &str) -> io::Result<()> {
-        let vis = self.visible_items();
-        let Some(it) = vis.get(self.cursor).copied() else {
+        let Some(li) = self.current_task_line() else {
             return Ok(());
         };
-        let (_, idx) = task_info(&self.lines[it.start]).unwrap();
-        let (_, stamp) = split_stamp(&self.lines[it.start][idx + 2..]);
-        let mut line = format!("{} {}", &self.lines[it.start][..idx + 2], text);
+        self.checkpoint();
+        let (_, idx) = task_info(&self.lines[li]).unwrap();
+        let (_, stamp) = split_stamp(&self.lines[li][idx + 2..]);
+        let mut line = format!("{} {}", &self.lines[li][..idx + 2], text);
         if let Some(st) = stamp {
             line.push_str(&format!(" @done({st})"));
         }
-        self.lines[it.start] = line;
+        self.lines[li] = line;
         self.save()
     }
 
-    fn open_input(&mut self, editing: bool) {
-        let mut textarea = if editing {
-            let vis = self.visible_items();
-            let Some(it) = vis.get(self.cursor).copied() else {
+    fn open_input(&mut self, kind: InputKind) {
+        let mut textarea = if kind == InputKind::Edit {
+            let Some(li) = self.current_task_line() else {
                 return;
             };
-            let (_, idx) = task_info(&self.lines[it.start]).unwrap();
-            let (title, _) = split_stamp(&self.lines[it.start][idx + 2..]);
+            let (_, idx) = task_info(&self.lines[li]).unwrap();
+            let (title, _) = split_stamp(&self.lines[li][idx + 2..]);
             TextArea::from(vec![title])
         } else {
             TextArea::default()
         };
+        if kind == InputKind::NewSub && self.visible_items().is_empty() {
+            return;
+        }
         textarea.set_cursor_line_style(Style::default());
         textarea.move_cursor(tui_textarea::CursorMove::End);
-        self.input = Some(InputState { editing, textarea });
+        self.input = Some(InputState { kind, textarea });
     }
 
     fn commit_input(&mut self) -> io::Result<()> {
@@ -500,11 +691,13 @@ impl App {
             self.status = "cancelled".to_string();
             return Ok(());
         }
-        if is.editing {
-            self.edit_title(&text)?;
-            self.status = "edited".to_string();
-        } else {
-            self.add_todo(&text)?;
+        match is.kind {
+            InputKind::Edit => {
+                self.edit_title(&text)?;
+                self.status = "edited".to_string();
+            }
+            InputKind::NewTask => self.add_todo(&text)?,
+            InputKind::NewSub => self.add_subtask(&text)?,
         }
         Ok(())
     }
@@ -552,6 +745,7 @@ impl App {
         let Some(ns) = self.notes.take() else {
             return Ok(());
         };
+        self.checkpoint();
         let mut children: Vec<String> = ns
             .textarea
             .lines()
@@ -577,6 +771,7 @@ impl App {
         let its = items(&self.lines);
         let mut rows = Vec::new();
         let mut it_idx = 0;
+        let mut vis_seen = 0;
         let mut i = 0;
         while i < self.lines.len() {
             let line = &self.lines[i];
@@ -619,6 +814,17 @@ impl App {
                     subs: (sub_total > 0).then_some((sub_done, sub_total)),
                     has_notes,
                 });
+                let expanded = self.expand_all || vis_seen == self.cursor;
+                vis_seen += 1;
+                if expanded {
+                    for &si in &self.sub_line_indices(it) {
+                        let (d, sidx) = task_info(&self.lines[si]).unwrap();
+                        rows.push(Row::Sub {
+                            text: self.lines[si][sidx + 2..].trim().to_string(),
+                            done: d,
+                        });
+                    }
+                }
                 continue;
             }
             i += 1;
@@ -675,37 +881,64 @@ fn run(path: &Path) -> io::Result<()> {
             continue;
         }
 
+        if app.show_help {
+            app.show_help = false;
+            continue;
+        }
+
         app.status.clear();
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.undo_last()?;
+            }
             KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Char('j') | KeyCode::Down if !shift => {
-                let n = app.visible_items().len();
-                if n > 0 && app.cursor < n - 1 {
-                    app.cursor += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up if !shift => {
-                app.cursor = app.cursor.saturating_sub(1);
-            }
+            KeyCode::Char('j') | KeyCode::Down if !shift => app.nav_down(),
+            KeyCode::Char('k') | KeyCode::Up if !shift => app.nav_up(),
             KeyCode::Char('J') | KeyCode::Down => app.move_item(1)?,
             KeyCode::Char('K') | KeyCode::Up => app.move_item(-1)?,
-            KeyCode::Char('n') | KeyCode::Char('N') => app.open_input(false),
-            KeyCode::Char('e') => app.open_input(true),
+            KeyCode::Char('n') | KeyCode::Char('N') => app.open_input(InputKind::NewTask),
+            KeyCode::Char('s') => app.open_input(InputKind::NewSub),
+            KeyCode::Char('e') => app.open_input(InputKind::Edit),
             KeyCode::Char('X') => app.delete_current()?,
+            KeyCode::Char('O') => {
+                app.expand_all = !app.expand_all;
+                if !app.expand_all {
+                    app.sub = None;
+                }
+                app.status = if app.expand_all {
+                    "expanded all"
+                } else {
+                    "collapsed"
+                }
+                .to_string();
+            }
+            KeyCode::Char('~') => app.show_help = true,
             KeyCode::Tab => app.open_notes(),
-            KeyCode::Char(' ') | KeyCode::Enter => app.toggle()?,
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if app.sub.is_some() {
+                    app.toggle_sub()?;
+                } else {
+                    app.toggle()?;
+                }
+            }
             KeyCode::Char('l') => app.cycle_later()?,
             KeyCode::Char('h') => {
                 app.hide_done = !app.hide_done;
+                app.sub = None;
                 app.clamp_cursor();
             }
-            KeyCode::Char('g') => app.cursor = 0,
+            KeyCode::Char('g') => {
+                app.cursor = 0;
+                app.sub = None;
+            }
             KeyCode::Char('G') => {
                 app.cursor = app.visible_items().len().saturating_sub(1);
+                app.sub = None;
             }
             KeyCode::Char('r') => {
                 app.reload()?;
+                app.sub = None;
                 app.status = "reloaded".to_string();
             }
             _ => {}
@@ -739,6 +972,7 @@ fn draw(f: &mut Frame, app: &App) {
     let inner_width = (main.width as usize).saturating_sub(4);
     let rows = app.rows();
     let mut task_seen = 0usize;
+    let mut sub_seen = 0usize;
     let mut selected_row = None;
     let items_ui: Vec<ListItem> = rows
         .iter()
@@ -755,10 +989,11 @@ fn draw(f: &mut Frame, app: &App) {
                 subs,
                 has_notes,
             } => {
-                if task_seen == app.cursor {
+                if task_seen == app.cursor && app.sub.is_none() {
                     selected_row = Some(ri);
                 }
                 task_seen += 1;
+                sub_seen = 0;
                 let (mark, mark_style, text_style) = if *done {
                     (
                         "[x] ",
@@ -792,6 +1027,26 @@ fn draw(f: &mut Frame, app: &App) {
                 }
                 ListItem::new(Line::from(spans))
             }
+            Row::Sub { text, done } => {
+                if task_seen == app.cursor + 1 && app.sub == Some(sub_seen) {
+                    selected_row = Some(ri);
+                }
+                sub_seen += 1;
+                let (mark, mark_style, text_style) = if *done {
+                    (
+                        "[x] ",
+                        Style::new().fg(Color::DarkGray),
+                        Style::new().fg(Color::DarkGray).crossed_out(),
+                    )
+                } else {
+                    ("[ ] ", Style::new().fg(Color::Green), Style::new())
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(mark, mark_style),
+                    Span::styled(text.clone(), text_style),
+                ]))
+            }
         })
         .collect();
 
@@ -823,17 +1078,67 @@ fn draw(f: &mut Frame, app: &App) {
         let block = Block::default()
             .borders(Borders::ALL)
             .padding(Padding::horizontal(1))
-            .title(if is.editing { " edit " } else { " new todo " });
+            .title(match is.kind {
+                InputKind::NewTask => " new todo ",
+                InputKind::NewSub => " new subtask ",
+                InputKind::Edit => " edit ",
+            });
         let inner = block.inner(area);
         f.render_widget(Clear, area);
         f.render_widget(block, area);
         f.render_widget(&is.textarea, inner);
     }
 
-    let help = if app.input.is_some() {
+    if app.show_help {
+        let binds = [
+            ("j/k", "move (walks into subtasks)"),
+            ("space/enter", "toggle done"),
+            ("n", "new todo"),
+            ("s", "new subtask"),
+            ("e", "edit title"),
+            ("X", "delete"),
+            ("J/K", "reorder"),
+            ("l", "todo <-> later"),
+            ("O", "expand/collapse all subtasks"),
+            ("tab", "notes editor"),
+            ("h", "hide done"),
+            ("g/G", "top / bottom"),
+            ("r", "reload from disk"),
+            ("ctrl+z", "undo"),
+            ("~", "this help"),
+            ("q/esc", "quit"),
+        ];
+        let lines: Vec<Line> = binds
+            .iter()
+            .map(|(k, desc)| {
+                Line::from(vec![
+                    Span::styled(format!("{k:>12}  "), Style::new().fg(Color::Cyan)),
+                    Span::raw(*desc),
+                ])
+            })
+            .collect();
+        let w = 48.min(main.width);
+        let h = (binds.len() as u16 + 2).min(main.height);
+        let area = Rect::new(
+            main.x + (main.width - w) / 2,
+            main.y + (main.height - h) / 2,
+            w,
+            h,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .title(" keybinds ");
+        f.render_widget(Clear, area);
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    let help = if app.show_help {
+        " any key to close".to_string()
+    } else if app.input.is_some() {
         " enter save · esc cancel".to_string()
     } else if app.status.is_empty() {
-        " j/k move · space done · n new · e edit · X del · J/K reorder · l later · tab notes · h hide done · q quit"
+        " j/k move · space done · n new · s sub · e edit · X del · O expand · ctrl+z undo · ~ help · q quit"
             .to_string()
     } else {
         format!(" {}", app.status)
@@ -856,9 +1161,13 @@ mod tests {
             mtime: None,
             cursor: 0,
             hide_done: false,
+            sub: None,
+            expand_all: false,
+            show_help: false,
             status: String::new(),
             notes: None,
             input: None,
+            undo: Vec::new(),
         }
     }
 
@@ -1011,6 +1320,104 @@ mod tests {
             app.lines[vis[1].start],
             "- [x] renamed @done(2026-08-29 09:00)"
         );
+        let _ = fs::remove_file(&app.path);
+    }
+
+    #[test]
+    fn nav_walks_into_subs_of_current_item_only() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] a",
+            "  - [ ] a1",
+            "  - [ ] a2",
+            "",
+            "- [ ] b",
+        ]);
+        app.nav_down();
+        assert_eq!((app.cursor, app.sub), (0, Some(0)));
+        app.nav_down();
+        assert_eq!((app.cursor, app.sub), (0, Some(1)));
+        app.nav_down();
+        assert_eq!((app.cursor, app.sub), (1, None));
+        // collapsed: moving up lands on a's main line, not its subs
+        app.nav_up();
+        assert_eq!((app.cursor, app.sub), (0, None));
+        // expand_all: moving up from b lands on a's last sub
+        app.expand_all = true;
+        app.cursor = 1;
+        app.sub = None;
+        app.nav_up();
+        assert_eq!((app.cursor, app.sub), (0, Some(1)));
+    }
+
+    #[test]
+    fn sub_toggle_sinks_below_open_subs_and_stays_in_block() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] p",
+            "  - [ ] s1",
+            "  - [ ] s2",
+            "  - [ ] s3",
+            "",
+            "## Done",
+        ]);
+        app.sub = Some(0);
+        app.toggle_sub().unwrap();
+        assert_eq!(app.lines[3], "  - [ ] s2");
+        assert_eq!(app.lines[4], "  - [ ] s3");
+        assert_eq!(app.lines[5], "  - [x] s1");
+        assert_eq!(app.sub, Some(2));
+        // parent block untouched: still one top-level item, nothing in Done
+        assert_eq!(app.visible_items().len(), 1);
+        assert_eq!(app.section_at(5), SectionKind::Todo);
+        // untoggle: floats back to end of the open group
+        app.toggle_sub().unwrap();
+        assert_eq!(app.lines[3], "  - [ ] s2");
+        assert_eq!(app.lines[4], "  - [ ] s3");
+        assert_eq!(app.lines[5], "  - [ ] s1");
+        assert_eq!(app.sub, Some(2));
+        let _ = fs::remove_file(&app.path);
+    }
+
+    #[test]
+    fn add_subtask_goes_after_open_subs_before_done() {
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] p",
+            "  - [ ] open1",
+            "  - [x] done1",
+            "",
+            "- [ ] q",
+        ]);
+        app.add_subtask("newsub").unwrap();
+        assert_eq!(app.lines[3], "  - [ ] open1");
+        assert_eq!(app.lines[4], "  - [ ] newsub");
+        assert_eq!(app.lines[5], "  - [x] done1");
+        assert_eq!(app.sub, Some(1));
+        let _ = fs::remove_file(&app.path);
+
+        // no subtasks yet: goes directly beneath the parent line, above notes
+        let mut app2 = app_from(&["# Todo", "", "- [ ] p", "  note line"]);
+        app2.add_subtask("first").unwrap();
+        assert_eq!(app2.lines[3], "  - [ ] first");
+        assert_eq!(app2.lines[4], "  note line");
+        let _ = fs::remove_file(&app2.path);
+    }
+
+    #[test]
+    fn undo_restores_previous_state() {
+        let mut app = app_from(&["# Todo", "", "- [ ] a", "- [ ] b"]);
+        app.delete_current().unwrap();
+        assert_eq!(app.visible_items().len(), 1);
+        app.undo_last().unwrap();
+        assert_eq!(app.visible_items().len(), 2);
+        assert_eq!(app.lines[2], "- [ ] a");
+        // empty stack: no panic, just a status
+        app.undo_last().unwrap();
+        assert_eq!(app.status, "nothing to undo");
         let _ = fs::remove_file(&app.path);
     }
 }
