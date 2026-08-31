@@ -1,0 +1,4 @@
+/target
+
+# personal todo lists — the app creates todo.md in the working directory
+todo.md

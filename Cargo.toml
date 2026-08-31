@@ -1,0 +1,20 @@
+[package]
+name = "locdo"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal todo app that is a thin wrapper around a markdown file"
+license = "MIT"
+repository = "https://github.com/ljgrohn/locdo"
+readme = "README.md"
+keywords = ["todo", "tui", "markdown", "terminal"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tui-textarea = "0.7"
+
+[profile.release]
+strip = true
+lto = true
