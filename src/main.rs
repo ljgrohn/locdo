@@ -17,11 +17,85 @@ use tui_textarea::TextArea;
 
 const STARTER: &str = "# Todo\n\n- [ ] Add your first item\n\n## Later\n\n## Done\n";
 
+/// Runs git in `dir`; Ok(stdout) on success, Err(last stderr line) on
+/// failure. Never prompts for credentials (fails instead).
+fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err.trim().lines().last().unwrap_or("git failed").to_string())
+    }
+}
+
+/// The directory to sync, if the todo file lives in a git repo that has a
+/// remote. Sync is entirely opt-in by construction: no repo, no sync.
+fn sync_repo(path: &Path) -> Option<PathBuf> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if run_git(dir, &["rev-parse", "--is-inside-work-tree"]).ok()? != "true" {
+        return None;
+    }
+    if run_git(dir, &["remote"]).ok()?.is_empty() {
+        return None;
+    }
+    Some(dir.to_path_buf())
+}
+
+/// Stages the todo file and its sidecars, commits if anything changed, and
+/// pushes. Best-effort: callers surface the Err as a status line.
+fn sync_commit_push(path: &Path) -> Result<String, String> {
+    let dir = sync_repo(path).ok_or("todo file is not in a git repo with a remote")?;
+    for f in [
+        path.to_path_buf(),
+        path.with_extension("archive.md"),
+        path.with_extension("done.md"),
+    ] {
+        if f.exists() {
+            run_git(&dir, &["add", &f.to_string_lossy()])?;
+        }
+    }
+    let dirty = run_git(&dir, &["diff", "--cached", "--quiet"]).is_err();
+    if dirty {
+        let msg = format!("locdo sync {}", Local::now().format("%Y-%m-%d %H:%M"));
+        run_git(&dir, &["commit", "--quiet", "-m", &msg])?;
+    }
+    run_git(&dir, &["push", "--quiet", "-u", "origin", "HEAD"])?;
+    Ok(if dirty {
+        "pushed".to_string()
+    } else {
+        "nothing to push".to_string()
+    })
+}
+
+fn sync_pull(path: &Path) -> Result<(), String> {
+    let dir = sync_repo(path).ok_or("no repo")?;
+    run_git(&dir, &["pull", "--rebase", "--autostash", "--quiet"]).map(|_| ())
+}
+
 fn main() -> io::Result<()> {
     let path = env::args()
         .nth(1)
         .map(PathBuf::from)
+        .or_else(|| env::var_os("LOCDO_FILE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("todo.md"));
+
+    let synced = sync_repo(&path).is_some();
+    let mut startup_status = None;
+    if synced {
+        if let Err(e) = sync_pull(&path) {
+            startup_status = Some(format!("sync pull failed: {e}"));
+        }
+    }
 
     if !path.exists() {
         fs::write(&path, STARTER)?;
@@ -29,9 +103,16 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
-    let result = run(&path);
+    let result = run(&path, startup_status);
     io::stdout().execute(LeaveAlternateScreen)?;
     disable_raw_mode()?;
+
+    if synced {
+        match sync_commit_push(&path) {
+            Ok(msg) => println!("locdo: {msg}"),
+            Err(e) => eprintln!("locdo: sync push failed: {e}"),
+        }
+    }
     result
 }
 
@@ -1182,9 +1263,12 @@ impl App {
     }
 }
 
-fn run(path: &Path) -> io::Result<()> {
+fn run(path: &Path, startup_status: Option<String>) -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::load(path)?;
+    if let Some(s) = startup_status {
+        app.status = s;
+    }
 
     loop {
         if app.notes.is_none()
@@ -1305,6 +1389,18 @@ fn run(path: &Path) -> io::Result<()> {
                 .to_string();
             }
             KeyCode::Char('~') => app.show_help = true,
+            KeyCode::Char('S') => {
+                app.status = match sync_commit_push(&app.path).and_then(|m| {
+                    sync_pull(&app.path)?;
+                    Ok(m)
+                }) {
+                    Ok(m) => {
+                        app.reload()?;
+                        format!("sync: {m}, pulled")
+                    }
+                    Err(e) => format!("sync: {e}"),
+                };
+            }
             KeyCode::Char('D') => {
                 let sidecar = app.path.with_extension("done.md");
                 match fs::read_to_string(&sidecar) {
@@ -1593,6 +1689,7 @@ fn draw(f: &mut Frame, app: &App) {
             ("tab", "notes editor"),
             ("h", "hide done"),
             ("D", "done history (older than 7 days)"),
+            ("S", "git sync (pull + push)"),
             ("g/G", "top / bottom"),
             ("r", "reload from disk"),
             ("ctrl+z", "undo"),
@@ -2076,6 +2173,49 @@ mod tests {
         assert_eq!(hist, hist2);
         let _ = fs::remove_file(&app.path);
         let _ = fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn sync_detects_repo_and_pushes_todo_files() {
+        let base = std::env::temp_dir().join(format!("locdo-sync-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let sh = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        };
+        let remote = base.join("remote.git");
+        fs::create_dir_all(&remote).unwrap();
+        sh(&remote, &["init", "--bare", "--quiet"]);
+        let work = base.join("work");
+        sh(&base, &["clone", "--quiet", remote.to_str().unwrap(), "work"]);
+        sh(&work, &["config", "user.email", "test@example.com"]);
+        sh(&work, &["config", "user.name", "Test"]);
+        let todo = work.join("todo.md");
+        fs::write(&todo, "# Todo\n\n- [ ] synced task\n").unwrap();
+
+        // a file outside any repo is not synced
+        assert!(sync_repo(&base.join("nowhere.md")).is_none() || base.join(".git").exists());
+        assert!(sync_repo(&todo).is_some());
+
+        let msg = sync_commit_push(&todo).unwrap();
+        assert!(msg.contains("pushed"), "got: {msg}");
+        let log = std::process::Command::new("git")
+            .args(["-C", remote.to_str().unwrap(), "log", "--oneline"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout).to_string();
+        assert!(log.contains("locdo sync"), "remote log: {log}");
+
+        // nothing new: no duplicate commit, still succeeds
+        let msg = sync_commit_push(&todo).unwrap();
+        assert!(msg.contains("nothing"), "got: {msg}");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

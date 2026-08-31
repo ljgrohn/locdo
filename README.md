@@ -43,21 +43,54 @@ Then, from anywhere:
 ```sh
 locdo                 # opens ./todo.md, created if missing
 locdo path/to/list.md # or point it at a specific file
+export LOCDO_FILE=~/todos/todo.md   # default file when no argument is given
 ```
 
 Works on Windows, macOS, and Linux (crossterm + ratatui).
+
+## Keep your todos in a private repo (multi-machine sync)
+
+Your actual todo list doesn't belong in this (or any public) repo. Put it in
+a small **private** GitHub repo instead, and locdo will sync it for you:
+
+```sh
+# one-time setup
+gh repo create my-todos --private --clone   # or create + clone however you like
+cd my-todos && touch todo.md && git add todo.md && git commit -m init && git push -u origin HEAD
+echo 'export LOCDO_FILE=~/my-todos/todo.md' >> ~/.zshrc
+```
+
+Sync is **on by construction, off by default**: if the todo file's directory
+is a git repo with a remote, locdo pulls (`--rebase --autostash`) on open,
+commits and pushes the todo file and its sidecars on exit, and `S` syncs
+mid-session. If the file isn't in a repo, locdo behaves exactly as before.
+Everything is best-effort — offline or auth failures show a warning and
+never block the app. On a second machine, clone the same repo, set
+`LOCDO_FILE`, and your list (plus archive and done history) follows you.
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` (or arrows) | move cursor |
-| `space` / `enter` | toggle done (moves item to/from the Done section) |
+| `j` / `k` (or arrows) | move cursor (walks into a task's subtasks) |
+| `space` / `enter` | toggle done (subtasks sink within their block; tasks move to Done) |
+| `n` | add a new todo to the inbox |
+| `s` | add a subtask under the current task (one level deep) |
+| `e` | edit the current task/subtask title |
+| `X` | delete the current task (with its block) or subtask |
+| `m` | move task to a section via popup (also creates new sections) |
+| `c` | collapse/expand the current section |
+| `A` | archive the selected collapsed section to `<name>.archive.md` |
+| `O` | expand/collapse all subtasks |
 | `tab` | open the notes/sub-todo editor for the item |
 | `shift+tab` / `esc` | save notes and return to the list |
 | `J` / `K` (Shift+arrows) | move item up/down |
 | `l` | move item to Later, or back to Todo if it's already there |
 | `h` | hide/show the Done section |
+| `D` | view done history (`<name>.done.md`, read-only) |
+| `S` | git sync now (when the file lives in a repo with a remote) |
+| `ctrl+z` | undo the last change |
+| `~` | show all keybinds |
 | `g` / `G` | jump to top / bottom |
 | `r` | reload from disk (also happens automatically) |
 | `q` / `esc` | quit |
@@ -75,6 +108,11 @@ Works on Windows, macOS, and Linux (crossterm + ratatui).
 - **External edits** (your editor, an agent, a script) are detected by polling
   the file's modified time every 250ms and reloaded in place. The app holds no
   unsaved state — every action writes through to the file immediately.
+- **Done rotation**: at startup, Done items stamped more than 7 days ago move
+  to a `<name>.done.md` sidecar, grouped by month, so the Done section only
+  shows the last week. `D` browses the full history read-only.
+- **Section archive**: `A` on a collapsed section appends it to
+  `<name>.archive.md` and removes it from the main file.
 
 ## File format
 
