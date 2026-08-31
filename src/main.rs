@@ -12,7 +12,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use tui_textarea::TextArea;
 
 const STARTER: &str = "# Todo\n\n- [ ] Add your first item\n\n## Later\n\n## Done\n";
@@ -98,6 +98,12 @@ struct MoveMenu {
     sel: usize,
 }
 
+/// Read-only view of the todo.done.md sidecar.
+struct HistoryView {
+    lines: Vec<String>,
+    scroll: u16,
+}
+
 /// Single-line prompt for adding a new todo/subtask or editing a title.
 struct InputState {
     kind: InputKind,
@@ -119,6 +125,7 @@ struct App {
     notes: Option<NotesState>,
     input: Option<InputState>,
     move_menu: Option<MoveMenu>,
+    history: Option<HistoryView>,
     /// Collapsed section names, in-memory only.
     collapsed: HashSet<String>,
     undo: Vec<Vec<String>>,
@@ -249,10 +256,12 @@ impl App {
             notes: None,
             input: None,
             move_menu: None,
+            history: None,
             collapsed: HashSet::new(),
             undo: Vec::new(),
         };
         app.reload()?;
+        app.rotate_done()?;
         Ok(app)
     }
 
@@ -427,6 +436,75 @@ impl App {
         self.clamp_cursor();
         self.status = "undo".to_string();
         self.save()
+    }
+
+    /// Rolls Done tasks stamped more than 7 days ago into the todo.done.md
+    /// sidecar, grouped under `## YYYY-MM` headings. Runs at startup; not
+    /// undoable (the sidecar would keep its copy anyway).
+    fn rotate_done(&mut self) -> io::Result<()> {
+        let Some(h) = self.heading_line("done") else {
+            return Ok(());
+        };
+        let end = self.lines[h + 1..]
+            .iter()
+            .position(|l| l.starts_with("##"))
+            .map(|p| h + 1 + p)
+            .unwrap_or(self.lines.len());
+        let cutoff = Local::now().naive_local() - chrono::Duration::days(7);
+        let mut rolled: Vec<(NaiveDateTime, Vec<String>)> = Vec::new();
+        let old: Vec<Item> = items(&self.lines)
+            .into_iter()
+            .filter(|it| it.start > h && it.start < end)
+            .collect();
+        for it in old.iter().rev() {
+            let (_, idx) = task_info(&self.lines[it.start]).unwrap();
+            let (_, stamp) = split_stamp(&self.lines[it.start][idx + 2..]);
+            let Some(dt) = stamp
+                .and_then(|s| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M").ok())
+            else {
+                continue;
+            };
+            if dt < cutoff {
+                let block = self.lines.drain(it.start..it.start + it.len).collect();
+                rolled.push((dt, block));
+            }
+        }
+        if rolled.is_empty() {
+            return Ok(());
+        }
+        rolled.reverse();
+        let sidecar = self.path.with_extension("done.md");
+        let mut hist: Vec<String> = fs::read_to_string(&sidecar)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        for (dt, block) in rolled {
+            let month = dt.format("## %Y-%m").to_string();
+            let insert_at = match hist.iter().position(|l| *l == month) {
+                Some(p) => hist[p + 1..]
+                    .iter()
+                    .position(|l| l.starts_with("##"))
+                    .map(|q| p + 1 + q)
+                    .unwrap_or(hist.len()),
+                None => {
+                    if !hist.is_empty() {
+                        hist.push(String::new());
+                    }
+                    hist.push(month);
+                    hist.push(String::new());
+                    hist.len()
+                }
+            };
+            for (k, line) in block.into_iter().enumerate() {
+                hist.insert(insert_at + k, line);
+            }
+        }
+        fs::write(&sidecar, hist.join("\n") + "\n")?;
+        self.tidy();
+        self.save()?;
+        self.clamp_cursor();
+        Ok(())
     }
 
     /// On a task: collapses its containing `##` section (cursor moves to the
@@ -1156,6 +1234,25 @@ fn run(path: &Path) -> io::Result<()> {
             continue;
         }
 
+        if app.history.is_some() {
+            if matches!(
+                key.code,
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('D')
+            ) {
+                app.history = None;
+            } else if let Some(hv) = app.history.as_mut() {
+                let max = hv.lines.len().saturating_sub(1) as u16;
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => hv.scroll = (hv.scroll + 1).min(max),
+                    KeyCode::Char('k') | KeyCode::Up => hv.scroll = hv.scroll.saturating_sub(1),
+                    KeyCode::Char('g') => hv.scroll = 0,
+                    KeyCode::Char('G') => hv.scroll = max,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
         if let Some(menu) = app.move_menu.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -1208,6 +1305,18 @@ fn run(path: &Path) -> io::Result<()> {
                 .to_string();
             }
             KeyCode::Char('~') => app.show_help = true,
+            KeyCode::Char('D') => {
+                let sidecar = app.path.with_extension("done.md");
+                match fs::read_to_string(&sidecar) {
+                    Ok(raw) => {
+                        app.history = Some(HistoryView {
+                            lines: raw.lines().map(String::from).collect(),
+                            scroll: 0,
+                        });
+                    }
+                    Err(_) => app.status = "no done history yet".to_string(),
+                }
+            }
             KeyCode::Tab => app.open_notes(),
             KeyCode::Char(' ') | KeyCode::Enter => {
                 if matches!(app.entries().get(app.cursor), Some(Entry::Section(_))) {
@@ -1246,6 +1355,44 @@ fn run(path: &Path) -> io::Result<()> {
 fn draw(f: &mut Frame, app: &App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+
+    if let Some(hv) = &app.history {
+        let styled: Vec<Line> = hv
+            .lines
+            .iter()
+            .map(|l| {
+                if is_heading(l) {
+                    Line::from(Span::styled(
+                        l.clone(),
+                        Style::new().fg(Color::Cyan).bold(),
+                    ))
+                } else if task_info(l).is_some() {
+                    Line::from(Span::raw(l.clone()))
+                } else {
+                    Line::from(Span::styled(l.clone(), Style::new().fg(Color::DarkGray)))
+                }
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .title(" done history (read-only) ");
+        f.render_widget(
+            Paragraph::new(styled)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((hv.scroll, 0)),
+            main,
+        );
+        f.render_widget(
+            Line::from(Span::styled(
+                " j/k scroll · g/G top/bottom · D or q close",
+                Style::new().fg(Color::DarkGray),
+            )),
+            footer,
+        );
+        return;
+    }
 
     if let Some(ns) = &app.notes {
         let block = Block::default()
@@ -1445,6 +1592,7 @@ fn draw(f: &mut Frame, app: &App) {
             ("O", "expand/collapse all subtasks"),
             ("tab", "notes editor"),
             ("h", "hide done"),
+            ("D", "done history (older than 7 days)"),
             ("g/G", "top / bottom"),
             ("r", "reload from disk"),
             ("ctrl+z", "undo"),
@@ -1513,6 +1661,7 @@ mod tests {
             notes: None,
             input: None,
             move_menu: None,
+            history: None,
             collapsed: HashSet::new(),
             undo: Vec::new(),
         }
@@ -1885,6 +2034,48 @@ mod tests {
         assert_eq!(app.status, "nothing to undo");
         assert_eq!(app.lines[2], "- [ ] external edit");
         let _ = fs::remove_file(&app.path);
+    }
+
+    #[test]
+    fn rotate_done_moves_week_old_tasks_to_sidecar() {
+        let old = (Local::now() - chrono::Duration::days(10))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let recent = (Local::now() - chrono::Duration::days(2))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "- [ ] open task",
+            "",
+            "## Done",
+            "",
+            &format!("- [x] recent one @done({recent})"),
+            &format!("- [x] old one @done({old})"),
+            "  a note on the old one",
+            "- [x] unstamped",
+        ]);
+        app.path = std::env::temp_dir().join(format!("locdo-test-rotate-{}.md", std::process::id()));
+        app.rotate_done().unwrap();
+        assert!(!app.lines.iter().any(|l| l.contains("old one")));
+        assert!(!app.lines.iter().any(|l| l.contains("a note on the old one")));
+        assert!(app.lines.iter().any(|l| l.contains("recent one")));
+        assert!(app.lines.iter().any(|l| l.contains("unstamped")));
+        let sidecar = app.path.with_extension("done.md");
+        let hist = fs::read_to_string(&sidecar).unwrap();
+        let month = (Local::now() - chrono::Duration::days(10))
+            .format("## %Y-%m")
+            .to_string();
+        assert!(hist.contains(&month), "got: {hist}");
+        assert!(hist.contains("- [x] old one @done("));
+        assert!(hist.contains("  a note on the old one"));
+        // rotating again is a no-op and doesn't duplicate
+        app.rotate_done().unwrap();
+        let hist2 = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(hist, hist2);
+        let _ = fs::remove_file(&app.path);
+        let _ = fs::remove_file(&sidecar);
     }
 
     #[test]
