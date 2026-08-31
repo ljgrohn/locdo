@@ -30,8 +30,19 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
+        // the diagnostic line, not git's trailing "hint:" advice
         let err = String::from_utf8_lossy(&out.stderr);
-        Err(err.trim().lines().last().unwrap_or("git failed").to_string())
+        let line = err
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("fatal:") || l.starts_with("error:") || l.starts_with('!'))
+            .or_else(|| {
+                err.lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with("hint:"))
+            })
+            .unwrap_or("git failed");
+        Err(line.to_string())
     }
 }
 
@@ -51,24 +62,36 @@ fn sync_repo(path: &Path) -> Option<PathBuf> {
     Some(dir.to_path_buf())
 }
 
-/// Stages the todo file and its sidecars, commits if anything changed, and
-/// pushes. Best-effort: callers surface the Err as a status line.
+/// Stages the todo file and its sidecars, commits them (and only them) if
+/// changed, pulls --rebase so a remote another machine moved ahead doesn't
+/// leave the push permanently rejected, then pushes. Best-effort: callers
+/// surface the Err as a status line.
 fn sync_commit_push(path: &Path) -> Result<String, String> {
     let dir = sync_repo(path).ok_or("todo file is not in a git repo with a remote")?;
+    // pathspecs must be relative to `git -C <dir>`, not to our cwd
+    let mut specs: Vec<String> = Vec::new();
     for f in [
         path.to_path_buf(),
         path.with_extension("archive.md"),
         path.with_extension("done.md"),
     ] {
         if f.exists() {
-            run_git(&dir, &["add", &f.to_string_lossy()])?;
+            let spec = f.strip_prefix(&dir).unwrap_or(&f).to_string_lossy().into_owned();
+            run_git(&dir, &["add", &spec])?;
+            specs.push(spec);
         }
     }
-    let dirty = run_git(&dir, &["diff", "--cached", "--quiet"]).is_err();
+    // diff --cached --quiet exits 1 when the staged todo files changed
+    let mut args = vec!["diff", "--cached", "--quiet", "--"];
+    args.extend(specs.iter().map(String::as_str));
+    let dirty = run_git(&dir, &args).is_err();
     if dirty {
         let msg = format!("locdo sync {}", Local::now().format("%Y-%m-%d %H:%M"));
-        run_git(&dir, &["commit", "--quiet", "-m", &msg])?;
+        let mut args = vec!["commit", "--quiet", "-m", &msg, "--"];
+        args.extend(specs.iter().map(String::as_str));
+        run_git(&dir, &args)?;
     }
+    git_pull_rebase(&dir)?;
     run_git(&dir, &["push", "--quiet", "-u", "origin", "HEAD"])?;
     Ok(if dirty {
         "pushed".to_string()
@@ -79,7 +102,23 @@ fn sync_commit_push(path: &Path) -> Result<String, String> {
 
 fn sync_pull(path: &Path) -> Result<(), String> {
     let dir = sync_repo(path).ok_or("no repo")?;
-    run_git(&dir, &["pull", "--rebase", "--autostash", "--quiet"]).map(|_| ())
+    git_pull_rebase(&dir)
+}
+
+/// Fetch + rebase onto upstream. A failed rebase (conflict) is aborted so
+/// the repo isn't left mid-rebase, which would make every later sync fail.
+fn git_pull_rebase(dir: &Path) -> Result<(), String> {
+    run_git(dir, &["fetch", "--quiet", "origin"])?;
+    // no upstream ref yet (brand-new or empty remote): nothing to rebase
+    // onto, and the later push -u will create it
+    if run_git(dir, &["rev-parse", "--verify", "--quiet", "@{u}"]).is_err() {
+        return Ok(());
+    }
+    if let Err(e) = run_git(dir, &["rebase", "--autostash", "--quiet", "@{u}"]) {
+        let _ = run_git(dir, &["rebase", "--abort"]);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn main() -> io::Result<()> {
@@ -285,6 +324,34 @@ fn fmt_stamp(stamp: &str) -> String {
     NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M")
         .map(|dt| dt.format("%b %-d, %H:%M").to_string())
         .unwrap_or_else(|_| stamp.to_string())
+}
+
+/// Normalizes blank lines: no runs of blanks, one blank around headings,
+/// no leading/trailing blanks.
+fn tidy_lines(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        let blank = line.trim().is_empty();
+        let prev_blank = out.last().is_none_or(|p: &String| p.trim().is_empty());
+        if blank && prev_blank {
+            continue;
+        }
+        if is_heading(line) && !prev_blank {
+            out.push(String::new());
+        }
+        out.push(line.clone());
+    }
+    let mut i = 0;
+    while i < out.len() {
+        if is_heading(&out[i]) && i + 1 < out.len() && !out[i + 1].trim().is_empty() {
+            out.insert(i + 1, String::new());
+        }
+        i += 1;
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out
 }
 
 /// Top-level tasks with their child blocks. Interior blank lines belong to a
@@ -532,6 +599,14 @@ impl App {
             .map(|p| h + 1 + p)
             .unwrap_or(self.lines.len());
         let cutoff = Local::now().naive_local() - chrono::Duration::days(7);
+        // read the sidecar before touching self.lines: a read failure here
+        // must not lose the drained blocks or clobber existing history
+        let sidecar = self.path.with_extension("done.md");
+        let mut hist: Vec<String> = match fs::read_to_string(&sidecar) {
+            Ok(raw) => raw.lines().map(String::from).collect(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
         let mut rolled: Vec<(NaiveDateTime, Vec<String>)> = Vec::new();
         let old: Vec<Item> = items(&self.lines)
             .into_iter()
@@ -554,12 +629,6 @@ impl App {
             return Ok(());
         }
         rolled.reverse();
-        let sidecar = self.path.with_extension("done.md");
-        let mut hist: Vec<String> = fs::read_to_string(&sidecar)
-            .unwrap_or_default()
-            .lines()
-            .map(String::from)
-            .collect();
         for (dt, block) in rolled {
             let month = dt.format("## %Y-%m").to_string();
             let insert_at = match hist.iter().position(|l| *l == month) {
@@ -569,18 +638,21 @@ impl App {
                     .map(|q| p + 1 + q)
                     .unwrap_or(hist.len()),
                 None => {
-                    if !hist.is_empty() {
-                        hist.push(String::new());
-                    }
-                    hist.push(month);
-                    hist.push(String::new());
-                    hist.len()
+                    // keep month headings in ascending (chronological) order
+                    let pos = hist
+                        .iter()
+                        .position(|l| l.starts_with("## ") && l.as_str() > month.as_str())
+                        .unwrap_or(hist.len());
+                    hist.insert(pos, month);
+                    hist.insert(pos + 1, String::new());
+                    pos + 2
                 }
             };
             for (k, line) in block.into_iter().enumerate() {
                 hist.insert(insert_at + k, line);
             }
         }
+        let hist = tidy_lines(&hist);
         fs::write(&sidecar, hist.join("\n") + "\n")?;
         self.tidy();
         self.save()?;
@@ -898,29 +970,7 @@ impl App {
     /// Normalizes blank lines: no runs of blanks, one blank around headings,
     /// no leading/trailing blanks.
     fn tidy(&mut self) {
-        let mut out: Vec<String> = Vec::new();
-        for line in &self.lines {
-            let blank = line.trim().is_empty();
-            let prev_blank = out.last().is_none_or(|p: &String| p.trim().is_empty());
-            if blank && prev_blank {
-                continue;
-            }
-            if is_heading(line) && !prev_blank {
-                out.push(String::new());
-            }
-            out.push(line.clone());
-        }
-        let mut i = 0;
-        while i < out.len() {
-            if is_heading(&out[i]) && i + 1 < out.len() && !out[i + 1].trim().is_empty() {
-                out.insert(i + 1, String::new());
-            }
-            i += 1;
-        }
-        while out.last().is_some_and(|l| l.trim().is_empty()) {
-            out.pop();
-        }
-        self.lines = out;
+        self.lines = tidy_lines(&self.lines);
     }
 
     fn toggle(&mut self) -> io::Result<()> {
@@ -1275,6 +1325,7 @@ fn run(path: &Path, startup_status: Option<String>) -> io::Result<()> {
         if app.notes.is_none()
             && app.input.is_none()
             && app.move_menu.is_none()
+            && app.history.is_none()
             && app.externally_modified()
         {
             app.reload()?;
@@ -1326,7 +1377,13 @@ fn run(path: &Path, startup_status: Option<String>) -> io::Result<()> {
             ) {
                 app.history = None;
             } else if let Some(hv) = app.history.as_mut() {
-                let max = hv.lines.len().saturating_sub(1) as u16;
+                // Paragraph scrolls by rendered rows, and wrap makes those
+                // outnumber logical lines; estimate with a row of slack each
+                let width = crossterm::terminal::size()
+                    .map(|(w, _)| (w as usize).saturating_sub(4).max(1))
+                    .unwrap_or(76);
+                let rows: usize = hv.lines.iter().map(|l| l.chars().count() / width + 1).sum();
+                let max = rows.saturating_sub(1) as u16;
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => hv.scroll = (hv.scroll + 1).min(max),
                     KeyCode::Char('k') | KeyCode::Up => hv.scroll = hv.scroll.saturating_sub(1),
@@ -1391,13 +1448,10 @@ fn run(path: &Path, startup_status: Option<String>) -> io::Result<()> {
             }
             KeyCode::Char('~') => app.show_help = true,
             KeyCode::Char('S') => {
-                app.status = match sync_commit_push(&app.path).and_then(|m| {
-                    sync_pull(&app.path)?;
-                    Ok(m)
-                }) {
+                app.status = match sync_commit_push(&app.path) {
                     Ok(m) => {
                         app.reload()?;
-                        format!("sync: {m}, pulled")
+                        format!("sync: {m}")
                     }
                     Err(e) => format!("sync: {e}"),
                 };
@@ -1411,7 +1465,10 @@ fn run(path: &Path, startup_status: Option<String>) -> io::Result<()> {
                             scroll: 0,
                         });
                     }
-                    Err(_) => app.status = "no done history yet".to_string(),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        app.status = "no done history yet".to_string();
+                    }
+                    Err(e) => app.status = format!("done history: {e}"),
                 }
             }
             KeyCode::Tab => app.open_notes(),
@@ -2176,36 +2233,48 @@ mod tests {
         let _ = fs::remove_file(&sidecar);
     }
 
-    #[test]
-    fn sync_detects_repo_and_pushes_todo_files() {
-        let base = std::env::temp_dir().join(format!("locdo-sync-test-{}", std::process::id()));
+    fn sh(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out);
+    }
+
+    /// Bare "remote" plus a configured clone, under a unique temp dir.
+    fn git_sandbox(tag: &str) -> (PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("locdo-{tag}-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        let sh = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}: {:?}", out);
-        };
         let remote = base.join("remote.git");
         fs::create_dir_all(&remote).unwrap();
         sh(&remote, &["init", "--bare", "--quiet"]);
-        let work = base.join("work");
         sh(&base, &["clone", "--quiet", remote.to_str().unwrap(), "work"]);
+        let work = base.join("work");
         sh(&work, &["config", "user.email", "test@example.com"]);
         sh(&work, &["config", "user.name", "Test"]);
+        (base, work)
+    }
+
+    #[test]
+    fn sync_detects_repo_and_pushes_todo_files() {
+        let (base, work) = git_sandbox("sync");
         let todo = work.join("todo.md");
         fs::write(&todo, "# Todo\n\n- [ ] synced task\n").unwrap();
 
-        // a file outside any repo is not synced
-        assert!(sync_repo(&base.join("nowhere.md")).is_none() || base.join(".git").exists());
+        // a file outside any repo is not synced (guarded: skip if the temp
+        // dir itself happens to sit inside some work tree)
+        if run_git(&base, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+            assert!(sync_repo(&base.join("nowhere.md")).is_none());
+        }
         assert!(sync_repo(&todo).is_some());
 
         let msg = sync_commit_push(&todo).unwrap();
         assert!(msg.contains("pushed"), "got: {msg}");
+        let remote = base.join("remote.git");
         let log = std::process::Command::new("git")
             .args(["-C", remote.to_str().unwrap(), "log", "--oneline"])
             .output()
@@ -2217,6 +2286,75 @@ mod tests {
         let msg = sync_commit_push(&todo).unwrap();
         assert!(msg.contains("nothing"), "got: {msg}");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sync_pulls_before_push_when_remote_is_ahead() {
+        let (base, work) = git_sandbox("diverge");
+        let todo = work.join("todo.md");
+        fs::write(&todo, "# Todo\n\n- [ ] first\n").unwrap();
+        sync_commit_push(&todo).unwrap();
+
+        // another machine pushes something else to the remote
+        let remote = base.join("remote.git");
+        sh(&base, &["clone", "--quiet", remote.to_str().unwrap(), "work2"]);
+        let work2 = base.join("work2");
+        sh(&work2, &["config", "user.email", "test@example.com"]);
+        sh(&work2, &["config", "user.name", "Test"]);
+        fs::write(work2.join("other.md"), "elsewhere\n").unwrap();
+        sh(&work2, &["add", "other.md"]);
+        sh(&work2, &["commit", "--quiet", "-m", "from machine two"]);
+        sh(&work2, &["push", "--quiet"]);
+
+        // local change on machine one must rebase onto that and push
+        fs::write(&todo, "# Todo\n\n- [ ] first\n- [ ] second\n").unwrap();
+        let msg = sync_commit_push(&todo).unwrap();
+        assert!(msg.contains("pushed"), "got: {msg}");
+        let log = std::process::Command::new("git")
+            .args(["-C", remote.to_str().unwrap(), "log", "--oneline"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout).to_string();
+        assert!(log.contains("from machine two"), "remote log: {log}");
+        assert_eq!(log.matches("locdo sync").count(), 2, "remote log: {log}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rotate_done_orders_months_ascending_with_separation() {
+        let old_aug = (Local::now() - chrono::Duration::days(10))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let old_far = (Local::now() - chrono::Duration::days(400))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let mut app = app_from(&[
+            "# Todo",
+            "",
+            "## Done",
+            "",
+            &format!("- [x] newer old @done({old_aug})"),
+            &format!("- [x] ancient @done({old_far})"),
+        ]);
+        app.path =
+            std::env::temp_dir().join(format!("locdo-test-months-{}.md", std::process::id()));
+        app.rotate_done().unwrap();
+        let sidecar = app.path.with_extension("done.md");
+        let hist = fs::read_to_string(&sidecar).unwrap();
+        let m_far = (Local::now() - chrono::Duration::days(400))
+            .format("## %Y-%m")
+            .to_string();
+        let m_aug = (Local::now() - chrono::Duration::days(10))
+            .format("## %Y-%m")
+            .to_string();
+        let (pf, pa) = (hist.find(&m_far).unwrap(), hist.find(&m_aug).unwrap());
+        assert!(pf < pa, "months not ascending:\n{hist}");
+        assert!(
+            hist.contains(&format!("\n\n{m_aug}")),
+            "no blank line before later month heading:\n{hist}"
+        );
+        let _ = fs::remove_file(&app.path);
+        let _ = fs::remove_file(&sidecar);
     }
 
     #[test]

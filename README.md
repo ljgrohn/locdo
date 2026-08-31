@@ -64,8 +64,9 @@ Sync is **on by construction, off by default**: if the todo file's directory
 is a git repo with a remote, locdo pulls (`--rebase --autostash`) on open,
 commits and pushes the todo file and its sidecars on exit, and `S` syncs
 mid-session. If the file isn't in a repo, locdo behaves exactly as before.
-Everything is best-effort — offline or auth failures show a warning and
-never block the app. On a second machine, clone the same repo, set
+Everything is best-effort — offline or auth failures show a warning instead
+of crashing (though a slow network can delay startup or exit while git
+waits). On a second machine, clone the same repo, set
 `LOCDO_FILE`, and your list (plus archive and done history) follows you.
 
 ## Keys
